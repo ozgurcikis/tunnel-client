@@ -90,6 +90,10 @@ type mcpProcessor struct {
 	withDeadlineCause   func(context.Context, time.Time, error) (context.Context, context.CancelFunc)
 }
 
+// rpcMethodPhaseKey carries only a method name through the dispatcher request context.
+// No payload, headers, or credentials are retained.
+type rpcMethodPhaseKey struct{}
+
 // responsePostResult keeps the control-plane request ID together with any
 // posting error so callers can consistently attach both fields to logs.
 type responsePostResult struct {
@@ -100,7 +104,16 @@ type responsePostResult struct {
 // postTunnelResponse wraps Responder.PostResponse and preserves its request ID
 // even when the post fails.
 func (p *mcpProcessor) postTunnelResponse(ctx context.Context, requestID types.RequestID, response *types.TunnelResponse) responsePostResult {
+	started := time.Now()
 	tunnelServiceRequestID, err := p.tunnelResponder.PostResponse(ctx, requestID, response)
+	if method, ok := ctx.Value(rpcMethodPhaseKey{}).(string); ok && method != "" {
+		p.logger.InfoContext(ctx, "MCP phase timing",
+			slog.String("phase", "post_response"),
+			slog.String("request_id", requestID.String()),
+			slog.String("rpc_method", method),
+			slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+		)
+	}
 	if err != nil {
 		recordWorkFailure(ctx, err, 0)
 	}
@@ -482,6 +495,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		return fmt.Errorf("unexpected command type %T", cmd.Message())
 	}
 
+	ctx = context.WithValue(ctx, rpcMethodPhaseKey{}, req.Method)
 	isNotification := !req.ID.IsValid()
 	if !isNotification {
 		ctx = tunnelctx.ContextWithRPCRequestID(ctx, req.ID)
@@ -493,7 +507,14 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	latencyRecorded := &latencyFlags{}
 
 	// Establish MCP connection only for JSON-RPC commands.
+	connectStarted := time.Now()
 	conn, err := channelCfg.transport.Connect(ctx)
+	logger.InfoContext(ctx, "MCP phase timing",
+		slog.String("phase", "transport_connect"),
+		slog.String("request_id", requestID.String()),
+		slog.String("rpc_method", req.Method),
+		slog.Int64("duration_ms", time.Since(connectStarted).Milliseconds()),
+	)
 	if err != nil {
 		recordWorkFailure(ctx, err, 0)
 		if ctx.Err() != nil {
